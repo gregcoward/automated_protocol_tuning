@@ -1,0 +1,18 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: bigip-tuner
+  namespace: bigip-tuner
+  annotations:
+    haproxy.router.openshift.io/timeout: 300s
+spec:
+  host: bigip-tuner.apps.example.com
+  to:
+    kind: Service
+    name: backend
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

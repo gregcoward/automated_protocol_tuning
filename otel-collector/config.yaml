@@ -1,0 +1,55 @@
+# OpenTelemetry Collector configuration for BIG-IP Protocol Performance Tuner
+# Strictly accepts and forwards ONLY Virtual Server flow & TCP/UDP/HTTP protocol tuning metrics.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+            - "*"
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 256
+    spike_limit_mib: 64
+
+  # Strict protocol-tuning metric allowlist: drop ASM, AFM, DNS, syslog, or unrelated telemetry
+  filter/protocol_tuning_only:
+    error_mode: ignore
+    metrics:
+      metric:
+        - 'not IsMatch(name, "^bigip_(vs|tcp|udp|http|tuning)_.*")'
+
+  # Deduplicate & batch points aligned with VictoriaMetrics -dedup.minScrapeInterval
+  batch:
+    send_batch_size: 1024
+    timeout: 5s
+
+exporters:
+  prometheusremotewrite:
+    endpoint: ${env:VICTORIAMETRICS_REMOTE_WRITE_URL:-http://victoriametrics:8428/api/v1/write}
+    add_metric_suffixes: false
+    resource_to_telemetry_conversion:
+      enabled: false
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 20s
+      max_elapsed_time: 120s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, filter/protocol_tuning_only, batch]
+      exporters: [prometheusremotewrite]

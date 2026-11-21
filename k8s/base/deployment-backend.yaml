@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bigip-tuner-backend
+  namespace: bigip-tuner
+  labels:
+    app: bigip-tuner-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bigip-tuner-backend
+  template:
+    metadata:
+      labels:
+        app: bigip-tuner-backend
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+      containers:
+        - name: backend
+          image: bigip-protocol-tuner:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: PORT
+              value: "8000"
+            - name: TUNER_CONFIG_DIR
+              value: /config
+            - name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+              value: http://otel-collector:4318/v1/metrics
+            - name: VICTORIAMETRICS_URL
+              value: http://victoriametrics:8428
+            - name: GRAFANA_INTERNAL_URL
+              value: http://grafana:3000
+            - name: GRAFANA_EXTERNAL_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: tuner-env
+                  key: GRAFANA_EXTERNAL_URL
+                  optional: true
+            - name: VM_RETENTION_PERIOD
+              value: "30d"
+            - name: VM_MAX_STORAGE_GB
+              value: "10.0"
+            - name: BIGIP_SESSION_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: tuner-secrets
+                  key: BIGIP_SESSION_ENCRYPTION_KEY
+                  optional: true
+          volumeMounts:
+            - name: config
+              mountPath: /config
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: tuner-config-pvc

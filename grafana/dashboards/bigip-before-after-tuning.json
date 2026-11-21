@@ -1,0 +1,266 @@
+{
+  "uid": "bigip-protocol-tuning",
+  "title": "BIG-IP Protocol Performance — Before/After Tuning",
+  "description": "Visualizes TCP/UDP/HTTP traffic performance with remediation event annotations",
+  "tags": ["bigip", "protocol-tuning", "before-after"],
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": false,
+        "iconColor": "rgba(255, 96, 96, 1)",
+        "name": "Remediation Events",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "bigip_host",
+        "label": "BIG-IP Host",
+        "type": "query",
+        "query": "label_values(bigip_vs_cur_conns, bigip_host)",
+        "datasource": { "uid": "victoriametrics-ds" },
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {}
+      },
+      {
+        "name": "virtual_server",
+        "label": "Virtual Server",
+        "type": "query",
+        "query": "label_values(bigip_vs_cur_conns{bigip_host=~\"$bigip_host\"}, virtual_server)",
+        "datasource": { "uid": "victoriametrics-ds" },
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Throughput — Bits In/Out (bps)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "uid": "victoriametrics-ds" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(bigip_vs_bits_in_total{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\"}[2m])",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} — bits_in"
+        },
+        {
+          "expr": "rate(bigip_vs_bits_out_total{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\"}[2m])",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} — bits_out"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Active Connections",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "uid": "victoriametrics-ds" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "bigip_vs_cur_conns{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\"}",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} — cur_conns"
+        },
+        {
+          "expr": "bigip_vs_ephemeral_cur_conns{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\"}",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} — ephemeral_conns"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "TCP Retransmission Rate (%) — Client & Server Side",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "uid": "victoriametrics-ds" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": { "lineWidth": 2, "fillOpacity": 8 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 2.5 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "bigip_tcp_retransmit_rate_pct{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\",context=\"clientside\"}",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} — clientside"
+        },
+        {
+          "expr": "bigip_tcp_retransmit_rate_pct{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\",context=\"serverside\"}",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} — serverside"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "TCP Zero-Window Events",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "uid": "victoriametrics-ds" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "increase(bigip_tcp_zero_window_events_total{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\"}[5m])",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} / {{context}} — zero_wnd/5m"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "TCP RTT — Mean (ms)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "uid": "victoriametrics-ds" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "lineWidth": 2, "fillOpacity": 6 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "bigip_tcp_rtt_ms{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\"}",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} / {{context}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "TCP Buffer Exhaustion Events",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "uid": "victoriametrics-ds" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "increase(bigip_tcp_buffer_exhaustion_total{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\"}[5m])",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} / {{context}} — buf_exhaustion/5m"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "UDP Packet Drop Rate (%)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "uid": "victoriametrics-ds" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "bigip_udp_drop_rate_pct{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\"}",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} — udp_drop_pct"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "HTTP Keep-Alive Reuse (reqs/conn)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "uid": "victoriametrics-ds" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 2, "fillOpacity": 8 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "bigip_http_keepalive_reqs_per_conn{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\"}",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} — ka_reuse"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "SYN Cookie Events",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "uid": "victoriametrics-ds" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "increase(bigip_vs_syn_cookies_total{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\"}[5m])",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} — syn_cookies/5m"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Packet Rate — In/Out (pps)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "datasource": { "uid": "victoriametrics-ds" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "pps",
+          "custom": { "lineWidth": 2, "fillOpacity": 8 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "rate(bigip_vs_pkts_in_total{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\"}[2m])",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} — pkts_in/s"
+        },
+        {
+          "expr": "rate(bigip_vs_pkts_out_total{bigip_host=~\"$bigip_host\",virtual_server=~\"$virtual_server\"}[2m])",
+          "legendFormat": "{{bigip_host}} / {{virtual_server}} — pkts_out/s"
+        }
+      ]
+    }
+  ]
+}

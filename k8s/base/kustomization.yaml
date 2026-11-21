@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: bigip-tuner
+
+resources:
+  - namespace.yaml
+  - pvcs.yaml
+  - configmap-otel.yaml
+  - deployment-backend.yaml
+  - deployment-otel.yaml
+  - deployment-vm.yaml
+  - deployment-grafana.yaml
+  - services.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: bigip-protocol-tuner
+  app.kubernetes.io/managed-by: kustomize

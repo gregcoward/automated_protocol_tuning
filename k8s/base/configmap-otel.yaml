@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: bigip-tuner
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: "0.0.0.0:4317"
+          http:
+            endpoint: "0.0.0.0:4318"
+
+    processors:
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 75
+        spike_limit_percentage: 20
+      batch:
+        send_batch_size: 1000
+        timeout: 10s
+      filter/protocol_tuning_only:
+        error_mode: ignore
+        metrics:
+          metric:
+            - 'not IsMatch(name, "^bigip_(vs|tcp|udp|http|tuning)_.*")'
+
+    exporters:
+      prometheusremotewrite:
+        endpoint: "http://victoriametrics:8428/api/v1/write"
+        tls:
+          insecure: true
+        retry_on_failure:
+          enabled: true
+          initial_interval: 5s
+          max_elapsed_time: 60s
+
+    extensions:
+      health_check:
+        endpoint: "0.0.0.0:13133"
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, filter/protocol_tuning_only, batch]
+          exporters: [prometheusremotewrite]

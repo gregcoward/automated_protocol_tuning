@@ -1,0 +1,15 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+.venv
+venv
+frontend/node_modules
+frontend/dist
+data
+*.key
+sessions.json
+.DS_Store
+docs
+k8s
+scripts
