@@ -343,10 +343,11 @@ Run these from the repository root:
 # Create the namespace first
 kubectl create namespace bigip-tuner --dry-run=client -o yaml | kubectl apply -f -
 
-# Grafana provisioning files (datasource + dashboard provider config)
+# Grafana provisioning files — keys must be flat (no slashes); the Deployment
+# volume's items: mapping places them into the correct subdirectory at mount time.
 kubectl create configmap grafana-provisioning \
-  --from-file=datasources/victoriametrics.yaml=grafana/provisioning/datasources/victoriametrics.yaml \
-  --from-file=dashboards/provider.yaml=grafana/provisioning/dashboards/provider.yaml \
+  --from-file=victoriametrics.yaml=grafana/provisioning/datasources/victoriametrics.yaml \
+  --from-file=provider.yaml=grafana/provisioning/dashboards/provider.yaml \
   -n bigip-tuner \
   --dry-run=client -o yaml | kubectl apply -f -
 

@@ -67,6 +67,14 @@ spec:
         - name: grafana-provisioning
           configMap:
             name: grafana-provisioning
+            items:
+              - key: victoriametrics.yaml
+                path: datasources/victoriametrics.yaml
+              - key: provider.yaml
+                path: dashboards/provider.yaml
         - name: grafana-dashboards
           configMap:
             name: grafana-dashboards
+            items:
+              - key: bigip-before-after-tuning.json
+                path: bigip-before-after-tuning.json
