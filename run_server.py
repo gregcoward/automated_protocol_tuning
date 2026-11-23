@@ -391,7 +391,7 @@ def list_bigips():
             client = _clients.get(sid)
 
         if client:
-            connected = client.is_authenticated()
+            connected = client.connected
             if connected:
                 try:
                     vs_list = client.discover_virtual_servers(enrolled if enrolled else None)
