@@ -21,8 +21,8 @@ spec:
         fsGroup: 1001
       containers:
         - name: backend
-          image: bigip-protocol-tuner:latest
-          imagePullPolicy: IfNotPresent
+          image: gregcoward/bigip-protocol-tuner:1.0.0
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8000
