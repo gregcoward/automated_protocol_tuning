@@ -169,69 +169,19 @@ def _scheduled_analysis_job(schedule_id: str) -> None:
     )
 
 
-def _apply_single_remediation(client: BigIpClient, rec: Any) -> None:
-    """Apply a single TuningRecommendation via iControl REST and persist the record."""
-    change_id = f"chg-{uuid.uuid4().hex[:10]}"
-    param_map = {d.parameter: {"from": d.current_value, "to": d.recommended_value} for d in rec.parameter_diffs}
-
-    pre_snapshot = {}
-    try:
-        pre_snapshot = client.get_profile_config(rec.protocol, rec.profile_full_path)
-    except Exception:
-        pass
-
-    applied_profile_path = rec.profile_full_path
-    created_child = False
-
-    if rec.target_profile_action == "create_and_attach_child_profile":
-        applied_profile_path = f"/{rec.partition}/{rec.suggested_profile_name}"
-        client.create_child_profile(
-            protocol=rec.protocol,
-            partition=rec.partition,
-            name=rec.suggested_profile_name,
-            defaults_from=rec.recommended_parent_profile or rec.profile_full_path,
-            params={d.parameter: d.recommended_value for d in rec.parameter_diffs},
-        )
-        client.attach_profile_to_vs(
-            vs_full_path=rec.virtual_server,
-            protocol=rec.protocol,
-            profile_full_path=applied_profile_path,
-            context=rec.context,
-            replace_full_path=rec.profile_full_path,
-        )
-        created_child = True
-    else:
-        client.patch_profile(
-            protocol=rec.protocol,
-            profile_full_path=rec.profile_full_path,
-            params={d.parameter: d.recommended_value for d in rec.parameter_diffs},
-        )
-
-    # Emit a Grafana annotation for the remediation event
-    try:
-        _emit_grafana_annotation(client.host, rec.virtual_server, rec.protocol, change_id)
-    except Exception:
-        pass
-
-    record = RemediationRecord(
-        change_id=change_id,
-        applied_at=_utc_now_iso(),
-        status="applied",
-        bigip_id=client.session_id,
-        bigip_host=client.host,
-        virtual_server=rec.virtual_server,
-        partition=rec.partition,
-        protocol=rec.protocol,
-        context=rec.context,
-        original_profile_full_path=rec.profile_full_path,
-        applied_profile_full_path=applied_profile_path,
-        created_child_profile=created_child,
-        parameter_changes=param_map,
-        pre_snapshot=pre_snapshot,
-        f5_kb_id=rec.f5_kb_id,
-        operator_note=None,
-    )
+def _apply_single_remediation(
+    client: BigIpClient, rec: Any, operator_note: str | None = None
+) -> None:
+    """Apply a single TuningRecommendation via ProfileRemediator and persist the record."""
+    from backend.optimizer.remediator import ProfileRemediator
+    remediator = ProfileRemediator()
+    record = remediator.apply(client, rec, operator_note=operator_note)
     _store.add_remediation_record(record)
+
+    try:
+        _emit_grafana_annotation(client.host, rec.virtual_server, rec.protocol, record.change_id)
+    except Exception:
+        pass
 
 
 def _emit_grafana_annotation(bigip_host: str, vs: str, protocol: str, change_id: str) -> None:
@@ -374,7 +324,7 @@ def connect_bigip(req: ConnectBigIpRequest):
     except Exception as exc:
         raise HTTPException(status_code=401, detail=f"BIG-IP authentication failed: {exc}")
 
-    identity = temp_client.get_device_identity()
+    # Identity fields are populated on the client object by authenticate()
     rec = _store.upsert_session(
         host=req.host,
         port=req.port,
@@ -384,9 +334,9 @@ def connect_bigip(req: ConnectBigIpRequest):
         enable_tmctl=req.enable_tmctl,
         demo_mode=req.demo_mode,
         label=req.label,
-        hostname=identity.get("hostname"),
-        version=identity.get("version"),
-        platform=identity.get("platform"),
+        hostname=temp_client.hostname,
+        version=temp_client.version,
+        platform=temp_client.platform,
     )
     sid = rec["id"]
     temp_client.session_id = sid
@@ -415,9 +365,9 @@ def connect_bigip(req: ConnectBigIpRequest):
         enable_tmctl=req.enable_tmctl,
         demo_mode=req.demo_mode,
         connected=True,
-        hostname=identity.get("hostname"),
-        version=identity.get("version"),
-        platform=identity.get("platform"),
+        hostname=temp_client.hostname,
+        version=temp_client.version,
+        platform=temp_client.platform,
         virtual_servers=vs_list,
         enrolled_count=len(enrolled),
     )
@@ -544,9 +494,7 @@ def apply_remediation(req: RemediationApplyRequest):
     for rec in req.recommendations:
         try:
             client = _get_or_create_client(rec.bigip_id)
-            if req.operator_note:
-                rec = rec.model_copy(update={})  # shallow copy
-            _apply_single_remediation(client, rec)
+            _apply_single_remediation(client, rec, operator_note=req.operator_note)
             applied_ids.append(rec.id)
         except Exception as exc:
             errors.append({"recommendation_id": rec.id, "error": str(exc)})
@@ -564,30 +512,12 @@ def rollback_remediation(change_id: str = FPath(...)):
         raise HTTPException(status_code=409, detail="Already rolled back")
 
     try:
+        from backend.optimizer.remediator import ProfileRemediator
         client = _get_or_create_client(record.bigip_id)
-        if record.created_child_profile:
-            # Reattach the original profile and optionally delete the child
-            client.attach_profile_to_vs(
-                vs_full_path=record.virtual_server,
-                protocol=record.protocol,
-                profile_full_path=record.original_profile_full_path,
-                context=record.context,
-                replace_full_path=record.applied_profile_full_path,
-            )
-        else:
-            # Restore pre-snapshot parameters
-            rollback_params = {k: v["from"] for k, v in record.parameter_changes.items()}
-            if rollback_params:
-                client.patch_profile(
-                    protocol=record.protocol,
-                    profile_full_path=record.applied_profile_full_path,
-                    params=rollback_params,
-                )
+        record = ProfileRemediator().rollback(client, record)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Rollback failed: {exc}")
 
-    record.status = "rolled_back"
-    record.rolled_back_at = _utc_now_iso()
     _store.update_remediation_record(record)
     return record
 
