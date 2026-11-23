@@ -264,7 +264,7 @@ async def lifespan(app: FastAPI):
     _analyzer = ProtocolAnalyzer(vm_client=_vm, otel_exporter=_otel)
 
     settings = _store.get_storage_settings()
-    _otel.update_endpoint(settings.otel_endpoint)
+    _otel.set_endpoint(settings.otel_endpoint)
 
     # Reconnect all persisted sessions
     for rec in _store.list_sessions():
@@ -699,7 +699,7 @@ def storage_status():
 def update_storage_settings(settings: StorageSettings):
     saved = _store.update_storage_settings(settings)
     # Update poll interval in scheduler
-    _otel.update_endpoint(settings.otel_endpoint)
+    _otel.set_endpoint(settings.otel_endpoint)
     if _scheduler.get_job("telemetry_poll"):
         _scheduler.reschedule_job(
             "telemetry_poll",
