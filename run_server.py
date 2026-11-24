@@ -15,21 +15,22 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import httpx
 import uvicorn
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import Body, Depends, FastAPI, HTTPException, Path as FPath
+from fastapi import FastAPI, HTTPException, Path as FPath, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.bigip_client import BigIpClient
 from backend.config import (
     FRONTEND_DIST_DIR,
+    GRAFANA_DASHBOARD_UID,
     GRAFANA_EXTERNAL_URL,
+    GRAFANA_INTERNAL_URL,
     VICTORIAMETRICS_URL,
     ensure_config_dir,
 )
@@ -39,15 +40,20 @@ from backend.models import (
     BigIpDeviceSummary,
     ConnectBigIpRequest,
     EnrollmentUpdateRequest,
+    ProtocolType,
     RemediationApplyRequest,
     RemediationRecord,
     ScheduleAuditEntry,
     ScheduleCreateRequest,
+    ScheduleUpdateRequest,
     StorageSettings,
     StorageStatusResponse,
     TuningSchedule,
 )
 from backend.optimizer.analyzer import ProtocolAnalyzer
+from backend.optimizer.knowledge_base import list_knowledge_base
+from backend.optimizer.remediator import ProfileRemediator
+from backend.optimizer.settings_catalog import list_profile_settings
 from backend.otel_exporter import OtelMetricsExporter
 from backend.session_store import SessionStore
 from backend.storage_manager import enforce_storage_limits, get_victoriametrics_disk_usage
@@ -91,6 +97,7 @@ def _get_or_create_client(session_id: str) -> BigIpClient:
                 verify_ssl=bool(rec.get("verify_ssl", False)),
                 enable_tmctl=bool(rec.get("enable_tmctl", False)),
                 demo_mode=bool(rec.get("demo_mode", False)),
+                label=rec.get("label"),
             )
             client.authenticate()
             _clients[session_id] = client
@@ -98,10 +105,9 @@ def _get_or_create_client(session_id: str) -> BigIpClient:
 
 
 def _scheduled_poll_job() -> None:
-    """Periodic telemetry poll for all registered BIG-IPs."""
-    with _clients_lock:
-        active_ids = list(_clients.keys())
-    for session_id in active_ids:
+    """Periodic telemetry poll for all persisted BIG-IP sessions (including boot-disconnected retries)."""
+    session_ids = [rec["id"] for rec in _store.list_sessions()]
+    for session_id in session_ids:
         try:
             client = _get_or_create_client(session_id)
             enrolled = _store.get_enrolled_vs(session_id)
@@ -112,7 +118,7 @@ def _scheduled_poll_job() -> None:
 
 
 def _scheduled_analysis_job(schedule_id: str) -> None:
-    """APScheduler job: run analysis and optionally auto-remediate per schedule config."""
+    """APScheduler job: run analysis and optionally auto-remediate safe recommendations."""
     schedule: TuningSchedule | None = None
     for s in _store.list_schedules():
         if s.id == schedule_id:
@@ -123,6 +129,7 @@ def _scheduled_analysis_job(schedule_id: str) -> None:
 
     recs_found = 0
     recs_applied = 0
+    recs_skipped_confirm = 0
     summary_parts: list[str] = []
 
     target_ids = schedule.bigip_ids or [rec["id"] for rec in _store.list_sessions()]
@@ -130,7 +137,7 @@ def _scheduled_analysis_job(schedule_id: str) -> None:
         try:
             client = _get_or_create_client(session_id)
             enrolled = _store.get_enrolled_vs(session_id)
-            recs, vs_count, source = _analyzer.analyze_device(
+            recs, _, source = _analyzer.analyze_device(
                 client=client,
                 enrolled_paths=enrolled,
                 target_vs_filter=set(schedule.virtual_servers) if schedule.virtual_servers else None,
@@ -142,12 +149,20 @@ def _scheduled_analysis_job(schedule_id: str) -> None:
                 min_conf = {"High": 3, "Medium": 2, "Low": 1}[schedule.min_confidence]
                 for rec in recs:
                     if min_conf <= {"High": 3, "Medium": 2, "Low": 1}[rec.confidence]:
+                        if not rec.safe_auto_apply:
+                            recs_skipped_confirm += 1
+                            continue
                         try:
-                            _apply_single_remediation(client, rec)
+                            _apply_single_remediation(
+                                client, rec, operator_note=f"Scheduled auto-remediate ({schedule.name})"
+                            )
                             recs_applied += 1
                         except Exception as exc:
                             logger.warning("Auto-remediation failed for %s: %s", rec.id, exc)
-            summary_parts.append(f"{client.host}: {len(recs)} recs (src={source})")
+            msg = f"{client.host}: {len(recs)} recs (src={source})"
+            if recs_skipped_confirm:
+                msg += f", {recs_skipped_confirm} held for operator review"
+            summary_parts.append(msg)
         except Exception as exc:
             logger.warning("Scheduled analysis failed for session %s: %s", session_id, exc)
             summary_parts.append(f"session {session_id}: ERROR {exc}")
@@ -171,26 +186,48 @@ def _scheduled_analysis_job(schedule_id: str) -> None:
 
 def _apply_single_remediation(
     client: BigIpClient, rec: Any, operator_note: str | None = None
-) -> None:
-    """Apply a single TuningRecommendation via ProfileRemediator and persist the record."""
-    from backend.optimizer.remediator import ProfileRemediator
+) -> RemediationRecord:
+    """Apply a single TuningRecommendation via ProfileRemediator, persist record, and raise on failure."""
     remediator = ProfileRemediator()
     record = remediator.apply(client, rec, operator_note=operator_note)
     _store.add_remediation_record(record)
 
+    if record.status == "failed":
+        raise RuntimeError(record.error_message or "Profile remediation failed on BIG-IP")
+
     try:
-        _emit_grafana_annotation(client.host, rec.virtual_server, rec.protocol, record.change_id)
+        _otel.emit_remediation_event(
+            bigip_host=client.host,
+            virtual_server=rec.virtual_server,
+            partition=rec.partition,
+            protocol=rec.protocol,
+            context=rec.context,
+            profile_name=record.applied_profile_full_path,
+            action="apply",
+            change_id=record.change_id,
+            summary=f"Applied {len(rec.parameter_diffs)} {rec.protocol.upper()} tuning param(s)",
+        )
     except Exception:
         pass
 
+    try:
+        _emit_grafana_annotation(
+            client.host, rec.virtual_server, rec.protocol, record.change_id, action="Tuning applied"
+        )
+    except Exception:
+        pass
 
-def _emit_grafana_annotation(bigip_host: str, vs: str, protocol: str, change_id: str) -> None:
-    from backend.config import GRAFANA_INTERNAL_URL
+    return record
+
+
+def _emit_grafana_annotation(
+    bigip_host: str, vs: str, protocol: str, change_id: str, action: str = "Tuning applied"
+) -> None:
     payload = {
-        "dashboardUID": "bigip-protocol-tuning",
+        "dashboardUID": GRAFANA_DASHBOARD_UID,
         "time": int(datetime.now(timezone.utc).timestamp() * 1000),
         "tags": ["remediation", "bigip-tuner", protocol],
-        "text": f"Tuning applied: {bigip_host} / {vs} [{protocol}] — {change_id}",
+        "text": f"{action}: {bigip_host} / {vs} [{protocol}] — {change_id}",
     }
     httpx.post(
         f"{GRAFANA_INTERNAL_URL}/api/annotations",
@@ -198,6 +235,48 @@ def _emit_grafana_annotation(bigip_host: str, vs: str, protocol: str, change_id:
         auth=("admin", os.environ.get("GF_SECURITY_ADMIN_PASSWORD", "admin")),
         timeout=5.0,
     )
+
+
+def _validate_and_parse_cron(expr: str) -> dict[str, str]:
+    """Parse standard 5-field cron expression: minute hour day month day_of_week."""
+    parts = (expr or "").strip().split()
+    if len(parts) != 5:
+        raise ValueError("cron_expression must be a 5-field cron string (minute hour day month day_of_week)")
+    return {
+        "minute": parts[0],
+        "hour": parts[1],
+        "day": parts[2],
+        "month": parts[3],
+        "day_of_week": parts[4],
+    }
+
+
+def _register_apscheduler_job(sched: TuningSchedule) -> None:
+    if _scheduler.get_job(sched.id):
+        _scheduler.remove_job(sched.id)
+    if not sched.enabled:
+        return
+    if sched.schedule_type == "cron":
+        if not sched.cron_expression:
+            raise ValueError("cron_expression is required when schedule_type='cron'")
+        cron_fields = _validate_and_parse_cron(sched.cron_expression)
+        _scheduler.add_job(
+            _scheduled_analysis_job,
+            "cron",
+            args=[sched.id],
+            id=sched.id,
+            replace_existing=True,
+            **cron_fields,
+        )
+    else:
+        _scheduler.add_job(
+            _scheduled_analysis_job,
+            "interval",
+            hours=sched.interval_hours,
+            args=[sched.id],
+            id=sched.id,
+            replace_existing=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +295,6 @@ async def lifespan(app: FastAPI):
     settings = _store.get_storage_settings()
     _otel.set_endpoint(settings.otel_endpoint)
 
-    # Reconnect all persisted sessions
     for rec in _store.list_sessions():
         try:
             _get_or_create_client(rec["id"])
@@ -224,7 +302,6 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning("Could not auto-reconnect %s: %s", rec.get("host", rec["id"]), exc)
 
-    # Kick off background scheduler
     _scheduler = BackgroundScheduler(timezone="UTC")
     _scheduler.add_job(
         _scheduled_poll_job,
@@ -234,52 +311,27 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
     _scheduler.add_job(
-        lambda: enforce_storage_limits(_store),
+        lambda: enforce_storage_limits(_store, _vm),
         "interval",
         minutes=15,
         id="storage_enforce",
         replace_existing=True,
     )
-    # Register persisted APScheduler jobs
     for sched in _store.list_schedules():
         if sched.enabled:
-            _register_apscheduler_job(sched)
+            try:
+                _register_apscheduler_job(sched)
+            except Exception as exc:
+                logger.warning("Skipping invalid persisted schedule %s: %s", sched.id, exc)
 
     _scheduler.start()
     logger.info("Scheduler started — telemetry poll every %ds", settings.poll_interval_seconds)
     yield
     _scheduler.shutdown(wait=False)
-
-
-def _register_apscheduler_job(sched: TuningSchedule) -> None:
-    if _scheduler.get_job(sched.id):
-        _scheduler.remove_job(sched.id)
-    if not sched.enabled:
-        return
-    if sched.schedule_type == "cron" and sched.cron_expression:
-        parts = sched.cron_expression.split()
-        if len(parts) == 5:
-            _scheduler.add_job(
-                _scheduled_analysis_job,
-                "cron",
-                args=[sched.id],
-                minute=parts[1],
-                hour=parts[2],
-                day=parts[3],
-                month=parts[4],
-                day_of_week=parts[0],
-                id=sched.id,
-                replace_existing=True,
-            )
-    else:
-        _scheduler.add_job(
-            _scheduled_analysis_job,
-            "interval",
-            hours=sched.interval_hours,
-            args=[sched.id],
-            id=sched.id,
-            replace_existing=True,
-        )
+    with _clients_lock:
+        for client in list(_clients.values()):
+            client.close()
+        _clients.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -287,15 +339,19 @@ def _register_apscheduler_job(sched: TuningSchedule) -> None:
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="BIG-IP Protocol Performance Tuner",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     docs_url="/api/docs",
     redoc_url=None,
 )
 
+_cors_origins = [
+    o.strip() for o in os.environ.get("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()
+] or ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -304,11 +360,9 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # BIG-IP Connection & Discovery
 # ---------------------------------------------------------------------------
-
 @app.post("/api/connect", response_model=BigIpDeviceSummary)
 def connect_bigip(req: ConnectBigIpRequest):
     """Register and authenticate a BIG-IP device."""
-    # Pre-auth to discover identity fields
     temp_client = BigIpClient(
         session_id="temp",
         host=req.host,
@@ -318,13 +372,14 @@ def connect_bigip(req: ConnectBigIpRequest):
         verify_ssl=req.verify_ssl,
         enable_tmctl=req.enable_tmctl,
         demo_mode=req.demo_mode,
+        label=req.label,
     )
     try:
         temp_client.authenticate()
     except Exception as exc:
+        temp_client.close()
         raise HTTPException(status_code=401, detail=f"BIG-IP authentication failed: {exc}")
 
-    # Identity fields are populated on the client object by authenticate()
     rec = _store.upsert_session(
         host=req.host,
         port=req.port,
@@ -342,7 +397,10 @@ def connect_bigip(req: ConnectBigIpRequest):
     temp_client.session_id = sid
 
     with _clients_lock:
+        old_client = _clients.get(sid)
         _clients[sid] = temp_client
+    if old_client and old_client is not temp_client:
+        old_client.close()
 
     enrolled = _store.get_enrolled_vs(sid) or []
     vs_list = []
@@ -351,7 +409,7 @@ def connect_bigip(req: ConnectBigIpRequest):
         if not enrolled:
             enrolled = [vs.full_path for vs in all_vs]
             _store.set_enrolled_vs(sid, enrolled)
-        vs_list = all_vs
+        vs_list = temp_client.discover_virtual_servers(enrolled)
     except Exception as exc:
         logger.warning("VS discovery failed for %s: %s", req.host, exc)
 
@@ -368,6 +426,8 @@ def connect_bigip(req: ConnectBigIpRequest):
         hostname=temp_client.hostname,
         version=temp_client.version,
         platform=temp_client.platform,
+        last_poll_at=temp_client.last_poll_at,
+        token_expires_at=temp_client.token_expires_iso,
         virtual_servers=vs_list,
         enrolled_count=len(enrolled),
     )
@@ -386,12 +446,17 @@ def list_bigips():
         vs_list = []
         enrolled = _store.get_enrolled_vs(sid) or []
         last_error = None
+        last_poll_at = None
+        token_expires_at = None
 
         with _clients_lock:
             client = _clients.get(sid)
 
         if client:
             connected = client.connected
+            last_poll_at = client.last_poll_at
+            token_expires_at = client.token_expires_iso
+            last_error = client.last_error
             if connected:
                 try:
                     vs_list = client.discover_virtual_servers(enrolled if enrolled else None)
@@ -412,7 +477,9 @@ def list_bigips():
                 hostname=hostname,
                 version=version,
                 platform=platform,
+                last_poll_at=last_poll_at,
                 last_error=last_error,
+                token_expires_at=token_expires_at,
                 virtual_servers=vs_list,
                 enrolled_count=len(enrolled),
             )
@@ -445,8 +512,19 @@ def update_enrollment(session_id: str, req: EnrollmentUpdateRequest):
 
 
 # ---------------------------------------------------------------------------
-# Analysis & Remediation
+# Analysis, Knowledge Base & Remediation
 # ---------------------------------------------------------------------------
+@app.get("/api/knowledge-base")
+def get_knowledge_base():
+    """Return F5 Knowledge Base articles powering protocol optimization."""
+    return list_knowledge_base()
+
+
+@app.get("/api/profile-settings")
+def get_profile_settings(protocol: ProtocolType | None = Query(default=None)):
+    """Return the complete catalog of TCP (76), UDP (9), and HTTP (50) profile settings."""
+    return list_profile_settings(protocol)
+
 
 @app.post("/api/analyze/run", response_model=AnalysisRunResponse)
 def run_analysis(req: AnalysisRequest):
@@ -459,7 +537,8 @@ def run_analysis(req: AnalysisRequest):
     for session_id in target_ids:
         try:
             client = _get_or_create_client(session_id)
-        except HTTPException:
+        except Exception as exc:
+            logger.warning("Skipping unreachable session %s during analysis: %s", session_id, exc)
             continue
         enrolled = _store.get_enrolled_vs(session_id)
         vs_filter = set(req.virtual_servers) if req.virtual_servers else None
@@ -489,7 +568,7 @@ def run_analysis(req: AnalysisRequest):
 def apply_remediation(req: RemediationApplyRequest):
     """Apply selected recommendations to BIG-IP(s) via iControl REST."""
     applied_ids: list[str] = []
-    errors: list[dict] = []
+    errors: list[dict[str, str]] = []
 
     for rec in req.recommendations:
         try:
@@ -512,13 +591,33 @@ def rollback_remediation(change_id: str = FPath(...)):
         raise HTTPException(status_code=409, detail="Already rolled back")
 
     try:
-        from backend.optimizer.remediator import ProfileRemediator
         client = _get_or_create_client(record.bigip_id)
         record = ProfileRemediator().rollback(client, record)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Rollback failed: {exc}")
 
     _store.update_remediation_record(record)
+    if record.status == "failed":
+        raise HTTPException(status_code=500, detail=record.error_message or "Rollback failed")
+
+    try:
+        _otel.emit_remediation_event(
+            bigip_host=record.bigip_host,
+            virtual_server=record.virtual_server,
+            partition=record.partition,
+            protocol=record.protocol,
+            context=record.context,
+            profile_name=record.original_profile_full_path,
+            action="rollback",
+            change_id=record.change_id,
+            summary=f"Rolled back {record.protocol.upper()} profile to {record.original_profile_full_path}",
+        )
+        _emit_grafana_annotation(
+            record.bigip_host, record.virtual_server, record.protocol, record.change_id, action="Rollback"
+        )
+    except Exception:
+        pass
+
     return record
 
 
@@ -530,24 +629,31 @@ def remediation_history(limit: int = 100):
 # ---------------------------------------------------------------------------
 # Schedules
 # ---------------------------------------------------------------------------
-
 @app.post("/api/schedules", response_model=TuningSchedule)
 def create_schedule(req: ScheduleCreateRequest):
+    if req.schedule_type == "cron":
+        try:
+            _validate_and_parse_cron(req.cron_expression or "")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
     sched = TuningSchedule(
         **req.model_dump(),
         id=f"sched-{uuid.uuid4().hex[:10]}",
         created_at=_utc_now_iso(),
     )
-    _store.upsert_schedule(sched)
     if sched.enabled:
-        _register_apscheduler_job(sched)
+        try:
+            _register_apscheduler_job(sched)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid schedule configuration: {exc}")
+    _store.upsert_schedule(sched)
     return sched
 
 
 @app.get("/api/schedules", response_model=list[TuningSchedule])
 def list_schedules():
     schedules = _store.list_schedules()
-    # Enrich with next_run_at from APScheduler
     for sched in schedules:
         job = _scheduler.get_job(sched.id)
         if job and job.next_run_time:
@@ -555,15 +661,24 @@ def list_schedules():
     return schedules
 
 
-@app.patch("/api/schedules/{schedule_id}")
-def update_schedule(schedule_id: str, updates: dict = Body(...)):
+@app.patch("/api/schedules/{schedule_id}", response_model=TuningSchedule)
+def update_schedule(schedule_id: str, req: ScheduleUpdateRequest):
     schedules = _store.list_schedules()
     sched = next((s for s in schedules if s.id == schedule_id), None)
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
+    updates = req.model_dump(exclude_unset=True)
     updated = sched.model_copy(update=updates)
+    if updated.schedule_type == "cron":
+        try:
+            _validate_and_parse_cron(updated.cron_expression or "")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+    try:
+        _register_apscheduler_job(updated)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid schedule configuration: {exc}")
     _store.upsert_schedule(updated)
-    _register_apscheduler_job(updated)
     return updated
 
 
@@ -585,35 +700,29 @@ def schedule_audit(limit: int = 50):
 # ---------------------------------------------------------------------------
 # Storage & Settings
 # ---------------------------------------------------------------------------
-
 @app.get("/api/storage/status", response_model=StorageStatusResponse)
 def storage_status():
     settings = _store.get_storage_settings()
-    used_bytes, _ = get_victoriametrics_disk_usage()
-    max_bytes = int(settings.max_storage_gb * 1024 * 1024 * 1024)
-    used_mb = used_bytes / (1024 * 1024)
-    pct = (used_bytes / max_bytes * 100) if max_bytes > 0 else 0.0
-
-    # Check VM health
-    vm_ok = False
-    vm_series = 0
-    otel_ok = False
-    try:
+    vm_bytes, vm_series, vm_ok = _vm.inspect_storage_usage()
+    if vm_bytes <= 0:
+        vm_bytes, _ = get_victoriametrics_disk_usage()
+    if not vm_ok:
         vm_ok = _vm.is_healthy()
-        if vm_ok:
-            vm_series = _vm.query_scalar("count(bigip_vs_cur_conns)") or 0  # type: ignore[assignment]
-    except Exception:
-        pass
-    try:
-        httpx.get(settings.otel_endpoint.replace("/v1/metrics", ""), timeout=2.0)
-        otel_ok = True
-    except Exception:
-        pass
+    if vm_ok and vm_series == 0:
+        try:
+            vm_series = int(_vm.query_scalar("count({__name__=~\"bigip_.*\"})") or 0)
+        except Exception:
+            vm_series = 0
+
+    max_bytes = int(settings.max_storage_gb * 1024 * 1024 * 1024)
+    used_mb = vm_bytes / (1024 * 1024)
+    pct = (vm_bytes / max_bytes * 100) if max_bytes > 0 else 0.0
+    otel_ok = _otel.check_health()
 
     last_enforced, enforcement_actions = _store.get_storage_enforcement_meta()
     return StorageStatusResponse(
         settings=settings,
-        used_bytes=used_bytes,
+        used_bytes=vm_bytes,
         used_mb=round(used_mb, 2),
         max_gb=settings.max_storage_gb,
         utilization_pct=round(pct, 2),
@@ -628,7 +737,6 @@ def storage_status():
 @app.put("/api/storage/settings", response_model=StorageSettings)
 def update_storage_settings(settings: StorageSettings):
     saved = _store.update_storage_settings(settings)
-    # Update poll interval in scheduler
     _otel.set_endpoint(settings.otel_endpoint)
     if _scheduler.get_job("telemetry_poll"):
         _scheduler.reschedule_job(
@@ -642,12 +750,11 @@ def update_storage_settings(settings: StorageSettings):
 # ---------------------------------------------------------------------------
 # Health & Info
 # ---------------------------------------------------------------------------
-
 @app.get("/api/health")
 def health():
     return {
         "status": "ok",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "bigips_connected": len(_clients),
         "vm_url": VICTORIAMETRICS_URL,
         "grafana_url": GRAFANA_EXTERNAL_URL,
@@ -657,7 +764,6 @@ def health():
 # ---------------------------------------------------------------------------
 # React SPA static file serving
 # ---------------------------------------------------------------------------
-
 if FRONTEND_DIST_DIR.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST_DIR / "assets"), name="assets")
 

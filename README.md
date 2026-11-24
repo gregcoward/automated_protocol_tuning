@@ -88,21 +88,21 @@ cp .env.example .env
 docker compose up -d --build
 
 # 4. Access
-open http://localhost:8010        # React UI + API
-open http://localhost:3010        # Grafana  (admin / value from .env)
-open http://localhost:8010/api/docs   # FastAPI Swagger
+open http://localhost:8000        # React UI + API
+open http://localhost:3000        # Grafana  (admin / value from .env)
+open http://localhost:8000/api/docs   # FastAPI Swagger
 ```
 
-**Default host port mapping** (shifted +10 to coexist with BIG-IP Telemetry Exporter on the same host):
+**Default host port mapping:**
 
 | Service | Host port | Container port |
 |---|---|---|
-| Tuner UI / API | **8010** | 8000 |
-| Grafana | **3010** | 3000 |
-| VictoriaMetrics | **8438** | 8428 |
-| OTLP HTTP | **4328** | 4318 |
+| Tuner UI / API | **8000** | 8000 |
+| Grafana | **3000** | 3000 |
+| VictoriaMetrics | **8428** | 8428 |
+| OTLP HTTP | **4318** | 4318 |
 
-> To use the standard ports, edit the left side of each `ports:` mapping in `docker-compose.yml`.
+> To shift ports (for example +10 to coexist with another exporter on the same host), edit the left side of each `ports:` mapping in `docker-compose.yml` and update `GRAFANA_EXTERNAL_URL` in `.env`.
 
 ---
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -12,6 +11,7 @@ import httpx
 
 if TYPE_CHECKING:
     from backend.session_store import SessionStore
+    from backend.vm_client import VictoriaMetricsClient
 
 from backend.config import VICTORIAMETRICS_DATA_PATH, VICTORIAMETRICS_URL
 
@@ -23,34 +23,54 @@ def _utc_now_iso() -> str:
 
 
 def get_victoriametrics_disk_usage(data_path: Path = VICTORIAMETRICS_DATA_PATH) -> tuple[int, bool]:
-    """Return (used_bytes, path_exists). Reads from /victoria-metrics-data or env-override."""
+    """Return (used_bytes, path_exists). Reads from /victoria-metrics-data or VictoriaMetrics /metrics."""
     if data_path.exists():
         try:
             total_size = sum(f.stat().st_size for f in data_path.rglob("*") if f.is_file())
-            return total_size, True
+            if total_size > 0:
+                return total_size, True
         except (OSError, PermissionError) as exc:
             logger.debug("Could not stat VM data path %s: %s", data_path, exc)
-    # Fallback: query VM metrics API for storage stats
+
+    # Fallback: query VM /metrics API (handles labeled vm_data_size_bytes{type=...} lines)
     try:
         r = httpx.get(f"{VICTORIAMETRICS_URL}/metrics", timeout=4.0)
         if r.status_code == 200:
+            total = 0
+            found = False
             for line in r.text.splitlines():
-                if line.startswith("vm_data_size_bytes ") and not line.startswith("#"):
-                    val = float(line.split()[-1])
-                    return int(val), False
+                if (line.startswith("vm_data_size_bytes{") or line.startswith("vm_data_size_bytes ")) and not line.startswith("#"):
+                    try:
+                        total += int(float(line.rsplit(" ", 1)[-1]))
+                        found = True
+                    except ValueError:
+                        pass
+            if found:
+                return total, False
     except Exception:
         pass
     return 0, False
 
 
-def enforce_storage_limits(store: "SessionStore") -> list[str]:
+def enforce_storage_limits(
+    store: "SessionStore",
+    vm_client: "VictoriaMetricsClient | None" = None,
+) -> list[str]:
     """Check disk usage vs configured max and attempt pruning if near/over capacity."""
     settings = store.get_storage_settings()
     max_bytes = int(settings.max_storage_gb * 1024 * 1024 * 1024)
     used_bytes, _ = get_victoriametrics_disk_usage()
     actions: list[str] = []
 
+    if vm_client is not None:
+        enrolled_union: set[str] = set()
+        for rec in store.list_sessions():
+            enrolled_union.update(store.get_enrolled_vs(rec["id"]) or [])
+        actions.extend(vm_client.enforce_storage_limits(settings, enrolled_union))
+
     if max_bytes <= 0 or used_bytes <= 0:
+        if actions:
+            store.record_storage_enforcement(actions)
         return actions
 
     utilization = used_bytes / max_bytes
@@ -63,7 +83,7 @@ def enforce_storage_limits(store: "SessionStore") -> list[str]:
         utilization * 100,
     )
 
-    if utilization >= 0.90:
+    if utilization >= 0.90 and vm_client is None:
         action_msg = (
             f"Storage at {utilization * 100:.1f}% ({used_mb:.0f} MB / {settings.max_storage_gb:.1f} GB). "
             f"Attempting series pruning."
@@ -71,11 +91,9 @@ def enforce_storage_limits(store: "SessionStore") -> list[str]:
         logger.warning(action_msg)
         actions.append(action_msg)
 
-        # Request a full forced merge/prune from VictoriaMetrics to reclaim stale data
         try:
-            r = httpx.post(
+            r = httpx.get(
                 f"{VICTORIAMETRICS_URL}/internal/force_merge",
-                params={"partition_prefix": ""},
                 timeout=30.0,
             )
             if r.status_code in (200, 204):
@@ -84,7 +102,6 @@ def enforce_storage_limits(store: "SessionStore") -> list[str]:
             logger.debug("VM force merge request failed: %s", exc)
 
     if utilization >= 0.95 and settings.auto_prune_enabled:
-        # Shorten retention by 25% to protect storage cap
         current_days = _parse_retention_days(settings.retention_period)
         new_days = max(7, int(current_days * 0.75))
         if new_days < current_days:

@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import { api } from '../api/client.js';
 
 const PANELS = [
   { title: 'Throughput In/Out', panelId: 1 },
@@ -19,8 +18,8 @@ function GrafanaPanel({ baseUrl, dashboardUid, panelId, vars, timeRange, title }
     theme: document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light',
     from: timeRange.from,
     to: timeRange.to,
-    'var-bigip_host': vars.bigip_host || 'All',
-    'var-virtual_server': vars.virtual_server || 'All',
+    'var-bigip_host': vars.bigip_host || '$__all',
+    'var-virtual_server': vars.virtual_server || '$__all',
   });
 
   const src = `${baseUrl}/d-solo/${dashboardUid}/bigip-protocol-performance-before-after-tuning?${params.toString()}`;
@@ -50,7 +49,6 @@ export default function DashboardPage({ bigips, storage }) {
   const [grafanaOk, setGrafanaOk] = useState(null);
 
   useEffect(() => {
-    // Probe Grafana availability
     fetch(`${grafanaUrl}/api/health`, { mode: 'no-cors' })
       .then(() => setGrafanaOk(true))
       .catch(() => setGrafanaOk(false));
@@ -127,8 +125,8 @@ export default function DashboardPage({ bigips, storage }) {
       </div>
 
       <div className="banner banner-info mt-2" style={{ fontSize: 12 }}>
-        Vertical annotation markers in each panel indicate exact tuning events.
-        Remediations emit Grafana annotations automatically via the API.
+        Vertical annotation markers in each panel indicate exact tuning and rollback events.
+        Remediations emit Grafana annotations and OTLP event metrics automatically.
         {grafanaUrl.includes('localhost') && ' In production, set GRAFANA_EXTERNAL_URL to the public hostname.'}
       </div>
     </div>

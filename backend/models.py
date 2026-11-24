@@ -10,6 +10,7 @@ ProtocolType = Literal["tcp", "udp", "http"]
 ProfileContext = Literal["clientside", "serverside", "all"]
 ConfidenceScore = Literal["High", "Medium", "Low"]
 ScheduleMode = Literal["recommend_only", "auto_remediate"]
+DiffCategory = Literal["telemetry", "dependency", "hygiene", "security"]
 
 
 class ConnectBigIpRequest(BaseModel):
@@ -50,6 +51,14 @@ class VirtualServerItem(BaseModel):
     availability_state: str = "available"
     enrolled: bool = True
     profiles: list[AttachedProfileRef] = Field(default_factory=list)
+    has_clientssl: bool = False
+    has_serverssl: bool = False
+    has_oneconnect: bool = False
+    has_apm: bool = False
+    has_asm: bool = False
+    has_fastl4: bool = False
+    irules: list[str] = Field(default_factory=list)
+    snat_type: str = "none"
 
 
 class BigIpDeviceSummary(BaseModel):
@@ -89,10 +98,14 @@ class AnalysisRequest(BaseModel):
 
 class ParameterDiff(BaseModel):
     parameter: str
+    gui_name: str | None = None
+    section: str | None = None
     current_value: Any
     recommended_value: Any
     unit: str | None = None
     rationale: str
+    category: DiffCategory = "telemetry"
+    safe_auto_apply: bool = True
 
 
 class TuningRecommendation(BaseModel):
@@ -110,6 +123,8 @@ class TuningRecommendation(BaseModel):
     target_profile_action: Literal["update_custom_profile", "create_and_attach_child_profile"]
     suggested_profile_name: str
     parameter_diffs: list[ParameterDiff]
+    advisories: list[str] = Field(default_factory=list)
+    settings_evaluated: int = 0
     supporting_evidence: str
     metrics_snapshot: dict[str, float] = Field(default_factory=dict)
     f5_kb_id: str
@@ -161,7 +176,10 @@ class ScheduleCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     schedule_type: Literal["interval", "cron"] = "interval"
     interval_hours: int = Field(default=6, ge=1, le=168)
-    cron_expression: str | None = Field(default=None, description="5-field cron expression when schedule_type=cron")
+    cron_expression: str | None = Field(
+        default=None,
+        description="5-field cron expression (min hour day month dow) when schedule_type=cron",
+    )
     bigip_ids: list[str] = Field(default_factory=list)
     virtual_servers: list[str] = Field(default_factory=list)
     protocols: list[ProtocolType] = Field(default_factory=lambda: ["tcp", "udp", "http"])
@@ -169,6 +187,20 @@ class ScheduleCreateRequest(BaseModel):
     mode: ScheduleMode = "recommend_only"
     min_confidence: ConfidenceScore = "High"
     enabled: bool = True
+
+
+class ScheduleUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    schedule_type: Literal["interval", "cron"] | None = None
+    interval_hours: int | None = Field(default=None, ge=1, le=168)
+    cron_expression: str | None = None
+    bigip_ids: list[str] | None = None
+    virtual_servers: list[str] | None = None
+    protocols: list[ProtocolType] | None = None
+    analysis_window: str | None = Field(default=None, pattern=r"^\d+(m|h|d|w)$")
+    mode: ScheduleMode | None = None
+    min_confidence: ConfidenceScore | None = None
+    enabled: bool | None = None
 
 
 class TuningSchedule(ScheduleCreateRequest):

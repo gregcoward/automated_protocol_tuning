@@ -96,8 +96,13 @@ function EnrollPanel({ device, onUpdated }) {
             <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{vs.full_path}</span>
             <span className="text-muted text-sm">{vs.destination}</span>
             {vs.profiles.map(p => (
-              <span key={p.full_path} className="tag tag-protocol" style={{ marginLeft: 4 }}>{p.protocol}</span>
+              <span key={`${p.full_path}-${p.context}`} className="tag tag-protocol" style={{ marginLeft: 4 }}>
+                {p.protocol}{p.context !== 'all' ? `:${p.context === 'clientside' ? 'cli' : 'srv'}` : ''}
+              </span>
             ))}
+            {vs.has_clientssl && <span className="tag tag-low" style={{ marginLeft: 4 }}>TLS</span>}
+            {vs.has_oneconnect && <span className="tag tag-low" style={{ marginLeft: 4 }}>OneConnect</span>}
+            {vs.irules?.length > 0 && <span className="tag tag-medium" style={{ marginLeft: 4 }}>iRules</span>}
           </label>
         ))}
         {device.virtual_servers.length === 0 && (

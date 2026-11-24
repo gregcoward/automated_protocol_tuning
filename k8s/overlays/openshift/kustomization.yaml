@@ -1,10 +1,15 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-bases:
+resources:
   - ../../base
+  - route-backend.yaml
+  - route-grafana.yaml
 
 namespace: bigip-tuner
+
+generatorOptions:
+  disableNameSuffixHash: true
 
 patches:
   # Drop explicit runAsUser — OpenShift assigns an arbitrary UID from the project's range
@@ -40,10 +45,6 @@ patches:
     target:
       kind: Deployment
       name: grafana
-
-resources:
-  - route-backend.yaml
-  - route-grafana.yaml
 
 configMapGenerator:
   - name: tuner-env

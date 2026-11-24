@@ -7,18 +7,31 @@ function ScheduleForm({ bigips, onCreated }) {
     name: '', schedule_type: 'interval', interval_hours: 6, cron_expression: '',
     protocols: ['tcp', 'udp', 'http'], analysis_window: '6h',
     mode: 'recommend_only', min_confidence: 'High', enabled: true,
-    bigip_ids: [], virtual_servers: [],
+    bigip_ids: [],
   });
-  const { run, loading, error } = useAsync(() => api.createSchedule(form));
+  const [vsInput, setVsInput] = useState('');
+  const { run, loading, error } = useAsync((payload) => api.createSchedule(payload));
 
   const submit = async (e) => {
     e.preventDefault();
-    const r = await run();
-    if (r) onCreated(r);
+    const payload = {
+      ...form,
+      virtual_servers: vsInput.trim() ? vsInput.split('\n').map(s => s.trim()).filter(Boolean) : [],
+    };
+    const r = await run(payload);
+    if (r) {
+      setForm(f => ({ ...f, name: '', cron_expression: '' }));
+      setVsInput('');
+      onCreated(r);
+    }
   };
 
   const toggleProtocol = (p) => setForm(f => ({
     ...f, protocols: f.protocols.includes(p) ? f.protocols.filter(x => x !== p) : [...f.protocols, p]
+  }));
+
+  const toggleBigIp = (id) => setForm(f => ({
+    ...f, bigip_ids: f.bigip_ids.includes(id) ? f.bigip_ids.filter(x => x !== id) : [...f.bigip_ids, id]
   }));
 
   return (
@@ -45,9 +58,9 @@ function ScheduleForm({ bigips, onCreated }) {
           </div>
         ) : (
           <div className="field">
-            <label>Cron (DoW H D M Y)</label>
+            <label>Cron (Min Hour Day Month DoW)</label>
             <input value={form.cron_expression} onChange={e => setForm(f => ({ ...f, cron_expression: e.target.value }))}
-              placeholder="0 2 * * *" style={{ fontFamily: 'monospace' }} />
+              placeholder="0 2 * * *" style={{ fontFamily: 'monospace' }} required />
           </div>
         )}
         <div className="field">
@@ -62,7 +75,7 @@ function ScheduleForm({ bigips, onCreated }) {
           <label>Mode</label>
           <select value={form.mode} onChange={e => setForm(f => ({ ...f, mode: e.target.value }))}>
             <option value="recommend_only">Recommend Only</option>
-            <option value="auto_remediate">Auto-Remediate</option>
+            <option value="auto_remediate">Auto-Remediate (Safe-Auto Items)</option>
           </select>
         </div>
         <div className="field">
@@ -91,7 +104,31 @@ function ScheduleForm({ bigips, onCreated }) {
           </label>
         </div>
       </div>
-      <button type="submit" className="btn btn-primary mt-2" disabled={loading}>
+      <div className="form-row mt-2">
+        <div className="field">
+          <label>Target BIG-IP(s)</label>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 4 }}>
+            <label className="checkbox-row">
+              <input type="checkbox" checked={form.bigip_ids.length === 0}
+                onChange={() => setForm(f => ({ ...f, bigip_ids: [] }))} />
+              <span>All devices</span>
+            </label>
+            {bigips.map(b => (
+              <label key={b.id} className="checkbox-row">
+                <input type="checkbox" checked={form.bigip_ids.includes(b.id)}
+                  onChange={() => toggleBigIp(b.id)} />
+                <span>{b.label || b.host}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+        <div className="field" style={{ flex: 2 }}>
+          <label>Target Virtual Servers (optional, one per line)</label>
+          <textarea rows={2} value={vsInput} onChange={e => setVsInput(e.target.value)}
+            placeholder="/Common/vip_ecommerce_https" style={{ fontFamily: 'monospace', fontSize: 12 }} />
+        </div>
+      </div>
+      <button type="submit" className="btn btn-primary mt-2" disabled={loading || form.protocols.length === 0}>
         {loading ? 'Creating…' : 'Create Schedule'}
       </button>
     </form>

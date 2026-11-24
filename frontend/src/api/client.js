@@ -9,7 +9,10 @@ async function request(method, path, body) {
   const res = await fetch(`${BASE}${path}`, opts);
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
-    try { detail = (await res.json()).detail || detail; } catch {}
+    try {
+      const json = await res.json();
+      detail = typeof json.detail === 'string' ? json.detail : JSON.stringify(json.detail) || detail;
+    } catch {}
     throw new Error(detail);
   }
   if (res.status === 204) return null;
@@ -23,8 +26,10 @@ export const api = {
   removeSession: (id) => request('DELETE', `/session/${id}`),
   updateEnrollment: (id, paths) => request('PUT', `/session/${id}/enrollment`, { enrolled_virtual_servers: paths }),
 
-  // Analysis
+  // Analysis & Reference Catalogs
   runAnalysis: (params) => request('POST', '/analyze/run', params),
+  knowledgeBase: () => request('GET', '/knowledge-base'),
+  profileSettings: (protocol) => request('GET', protocol ? `/profile-settings?protocol=${protocol}` : '/profile-settings'),
 
   // Remediation
   applyRemediation: (recommendations, note) => request('POST', '/remediate/apply', { recommendations, operator_note: note }),

@@ -13,6 +13,20 @@ if [[ ! -d "${KUSTOMIZE_PATH}" ]]; then
   exit 1
 fi
 
+echo "→ Provisioning namespace & Grafana ConfigMaps"
+kubectl create namespace bigip-tuner --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create configmap grafana-provisioning \
+  --from-file=victoriametrics.yaml="${REPO_ROOT}/grafana/provisioning/datasources/victoriametrics.yaml" \
+  --from-file=provider.yaml="${REPO_ROOT}/grafana/provisioning/dashboards/provider.yaml" \
+  -n bigip-tuner \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl create configmap grafana-dashboards \
+  --from-file=bigip-before-after-tuning.json="${REPO_ROOT}/grafana/dashboards/bigip-before-after-tuning.json" \
+  -n bigip-tuner \
+  --dry-run=client -o yaml | kubectl apply -f -
+
 echo "→ Deploying with overlay: ${OVERLAY}"
 kubectl apply -k "${KUSTOMIZE_PATH}"
 

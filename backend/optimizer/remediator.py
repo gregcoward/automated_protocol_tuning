@@ -7,12 +7,23 @@ import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-from backend.models import RemediationRecord, TuningRecommendation
+from backend.bigip_client import normalize_profile_attachment, split_full_path
+from backend.models import ProtocolType, RemediationRecord, TuningRecommendation
 
 if TYPE_CHECKING:
     from backend.bigip_client import BigIpClient
 
 logger = logging.getLogger(__name__)
+
+
+def _get_nested_val(data: dict[str, Any], dotted_key: str, default: Any = None) -> Any:
+    cur: Any = data
+    for part in dotted_key.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return default
+    return cur
 
 
 class ProfileRemediator:
@@ -21,13 +32,10 @@ class ProfileRemediator:
 
     Rules:
     - Never PATCH a system-default profile directly (BigIpClient.patch_profile enforces this).
-    - Always create a child profile inheriting from the target, then swap the VS attachment.
-    - Stores a pre-snapshot so rollback can restore previous state.
+    - Always create (or update) a child profile inheriting from the target parent, then swap the VS attachment.
+    - Preserves 'all' context on HTTP/UDP profiles and splits/coalesces 'all' context cleanly on TCP profiles.
+    - Stores a pre-snapshot so rollback can restore previous state safely even out-of-order.
     """
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def apply(
         self,
@@ -45,7 +53,6 @@ class ProfileRemediator:
         created_child = False
 
         try:
-            # Always capture the current profile state before touching anything
             try:
                 pre_snapshot = client.get_profile_config(rec.protocol, rec.profile_full_path)
             except Exception:
@@ -56,7 +63,7 @@ class ProfileRemediator:
                 child_name = rec.suggested_profile_name
                 partition = rec.partition
 
-                self._create_and_attach_child(
+                orig_ctx = self._create_and_attach_child(
                     client=client,
                     protocol=rec.protocol,
                     partition=partition,
@@ -67,12 +74,14 @@ class ProfileRemediator:
                     context=rec.context,
                     replace_full_path=rec.profile_full_path,
                 )
+                pre_snapshot["__original_vs_context__"] = orig_ctx
                 applied_full_path = f"/{partition}/{child_name}"
                 created_child = True
-
             else:
-                # update_custom_profile — PATCH in place (never a system default)
                 nested = self._flatten_params_dict(params)
+                # Mirror maxRequests if legacy top-level key also exists in custom HTTP profile
+                if rec.protocol == "http" and "enforcement.maxRequests" in params and "maxRequests" in pre_snapshot:
+                    nested["maxRequests"] = params["enforcement.maxRequests"]
                 client.patch_profile(rec.protocol, rec.profile_full_path, nested)
 
         except Exception as exc:
@@ -132,34 +141,37 @@ class ProfileRemediator:
 
         try:
             if record.created_child_profile:
-                # Swap the VS back to the original profile; orphan child is left in place
-                self._swap_vs_profile(
+                orig_vs_ctx = str((record.pre_snapshot or {}).get("__original_vs_context__", ""))
+                self._rollback_vs_profile(
                     client=client,
                     protocol=record.protocol,
                     vs_full_path=record.virtual_server,
                     context=record.context,
-                    old_full_path=record.applied_profile_full_path,
-                    new_full_path=record.original_profile_full_path,
+                    applied_full_path=record.applied_profile_full_path,
+                    original_full_path=record.original_profile_full_path,
+                    original_vs_context=orig_vs_ctx,
                 )
-                # Attempt to delete the child profile; non-fatal if it fails
                 try:
-                    client.request(
-                        "DELETE",
-                        f"/mgmt/tm/ltm/profile/{record.protocol}/"
-                        + _full_path_to_rest_id(record.applied_profile_full_path),
-                    )
+                    client.delete_profile(record.protocol, record.applied_profile_full_path)
                 except Exception as exc:
-                    logger.warning("Could not delete orphan child profile during rollback: %s", exc)
+                    logger.warning("Could not delete child profile during rollback: %s", exc)
             else:
-                # Restore previous parameter values
                 restore_params: dict[str, Any] = {}
                 for param, before_after in record.parameter_changes.items():
+                    fallback_before = before_after.get("before")
                     restore_params[param] = (
-                        record.pre_snapshot.get(param, before_after["before"])
+                        _get_nested_val(record.pre_snapshot, param, fallback_before)
                         if record.pre_snapshot
-                        else before_after["before"]
+                        else fallback_before
                     )
                 nested = self._flatten_params_dict(restore_params)
+                if (
+                    record.protocol == "http"
+                    and "enforcement.maxRequests" in restore_params
+                    and record.pre_snapshot
+                    and "maxRequests" in record.pre_snapshot
+                ):
+                    nested["maxRequests"] = restore_params["enforcement.maxRequests"]
                 client.patch_profile(record.protocol, record.original_profile_full_path, nested)
 
         except Exception as exc:
@@ -170,16 +182,16 @@ class ProfileRemediator:
 
         record.status = "rolled_back"
         record.rolled_back_at = now
+        record.error_message = None
         return record
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
-
     def _create_and_attach_child(
         self,
         client: "BigIpClient",
-        protocol: str,
+        protocol: ProtocolType,
         partition: str,
         child_name: str,
         defaults_from: str,
@@ -187,17 +199,23 @@ class ProfileRemediator:
         vs_full_path: str,
         context: str,
         replace_full_path: str,
-    ) -> None:
-        """Create a child profile inheriting from defaults_from, apply params, then attach to VS."""
-        payload = self._flatten_params_dict(params)
-        payload["name"] = child_name
-        payload["partition"] = partition
-        payload["defaultsFrom"] = defaults_from
-
-        client.create_profile(protocol, payload)
-
+    ) -> str:
+        """Create (or update if existing) a child profile and attach it cleanly to the VS."""
+        nested_params = self._flatten_params_dict(params)
         new_full_path = f"/{partition}/{child_name}"
-        self._swap_vs_profile(
+
+        if client.profile_exists(protocol, new_full_path):
+            patch_body = dict(nested_params)
+            patch_body["defaultsFrom"] = defaults_from
+            client.patch_profile(protocol, new_full_path, patch_body)
+        else:
+            payload = dict(nested_params)
+            payload["name"] = child_name
+            payload["partition"] = partition
+            payload["defaultsFrom"] = defaults_from
+            client.create_profile(protocol, payload)
+
+        return self._swap_vs_profile(
             client=client,
             protocol=protocol,
             vs_full_path=vs_full_path,
@@ -209,27 +227,140 @@ class ProfileRemediator:
     def _swap_vs_profile(
         self,
         client: "BigIpClient",
-        protocol: str,
+        protocol: ProtocolType,
         vs_full_path: str,
         context: str,
         old_full_path: str,
         new_full_path: str,
-    ) -> None:
-        """Replace old_full_path with new_full_path in a VS's profile list."""
+    ) -> str:
+        """Replace old_full_path with new_full_path on a Virtual Server, respecting context semantics."""
         raw_profiles = client.get_virtual_server_raw_profiles(vs_full_path)
+        new_part, new_name = split_full_path(new_full_path)
+        old_part, old_name = split_full_path(old_full_path)
 
-        updated = []
+        updated: list[dict[str, Any]] = []
         swapped = False
-        for entry in raw_profiles:
-            entry_fp = entry.get("fullPath") or f"/{entry.get('partition', 'Common')}/{entry['name']}"
-            if entry_fp == old_full_path:
-                updated.append({"name": new_full_path, "context": context})
-                swapped = True
-            else:
-                updated.append(entry)
+        original_vs_ctx = context
+
+        for raw_entry in raw_profiles:
+            entry = normalize_profile_attachment(raw_entry)
+            entry_fp = entry["fullPath"]
+            entry_ctx = entry["context"]
+
+            if not swapped and entry_fp in (old_full_path, new_full_path):
+                if protocol in ("http", "udp"):
+                    # HTTP and UDP profiles attach with context='all' (preserve existing context)
+                    original_vs_ctx = entry_ctx
+                    updated.append(
+                        {
+                            "name": new_name,
+                            "partition": new_part,
+                            "fullPath": new_full_path,
+                            "context": entry_ctx,
+                        }
+                    )
+                    swapped = True
+                    continue
+
+                # TCP profile attachment: match exact side or split 'all' cleanly into clientside + serverside
+                if entry_ctx == context:
+                    original_vs_ctx = entry_ctx
+                    updated.append(
+                        {
+                            "name": new_name,
+                            "partition": new_part,
+                            "fullPath": new_full_path,
+                            "context": context,
+                        }
+                    )
+                    swapped = True
+                    continue
+
+                if entry_ctx == "all":
+                    original_vs_ctx = "all"
+                    opposite_ctx = "serverside" if context == "clientside" else "clientside"
+                    updated.append(
+                        {
+                            "name": new_name,
+                            "partition": new_part,
+                            "fullPath": new_full_path,
+                            "context": context,
+                        }
+                    )
+                    updated.append(
+                        {
+                            "name": old_name,
+                            "partition": old_part,
+                            "fullPath": old_full_path,
+                            "context": opposite_ctx,
+                        }
+                    )
+                    swapped = True
+                    continue
+
+            updated.append(entry)
 
         if not swapped:
-            updated.append({"name": new_full_path, "context": context})
+            attach_ctx = "all" if protocol in ("http", "udp") else context
+            updated.append(
+                {
+                    "name": new_name,
+                    "partition": new_part,
+                    "fullPath": new_full_path,
+                    "context": attach_ctx,
+                }
+            )
+
+        client.update_virtual_server_profiles(vs_full_path, updated)
+        return original_vs_ctx
+
+    def _rollback_vs_profile(
+        self,
+        client: "BigIpClient",
+        protocol: ProtocolType,
+        vs_full_path: str,
+        context: str,
+        applied_full_path: str,
+        original_full_path: str,
+        original_vs_context: str,
+    ) -> None:
+        """Restore original_full_path on VS and coalesce split TCP 'all' attachments if applicable."""
+        raw_profiles = client.get_virtual_server_raw_profiles(vs_full_path)
+        orig_part, orig_name = split_full_path(original_full_path)
+
+        updated: list[dict[str, Any]] = []
+        restored = False
+        for raw_entry in raw_profiles:
+            entry = normalize_profile_attachment(raw_entry)
+            if not restored and entry["fullPath"] == applied_full_path:
+                if protocol in ("http", "udp") or entry["context"] in (context, "all"):
+                    updated.append(
+                        {
+                            "name": orig_name,
+                            "partition": orig_part,
+                            "fullPath": original_full_path,
+                            "context": entry["context"],
+                        }
+                    )
+                    restored = True
+                    continue
+            updated.append(entry)
+
+        # If TCP was originally attached with context='all' and both sides now point to original_full_path, coalesce
+        if protocol == "tcp" and original_vs_context == "all":
+            matching = [e for e in updated if e["fullPath"] == original_full_path]
+            contexts = {e["context"] for e in matching}
+            if {"clientside", "serverside"}.issubset(contexts):
+                coalesced = [e for e in updated if e["fullPath"] != original_full_path]
+                coalesced.append(
+                    {
+                        "name": orig_name,
+                        "partition": orig_part,
+                        "fullPath": original_full_path,
+                        "context": "all",
+                    }
+                )
+                updated = coalesced
 
         client.update_virtual_server_profiles(vs_full_path, updated)
 
@@ -251,8 +382,3 @@ class ProfileRemediator:
             else:
                 result[key] = value
         return result
-
-
-def _full_path_to_rest_id(full_path: str) -> str:
-    """Convert /Partition/name → ~Partition~name for iControl REST URLs."""
-    return full_path.lstrip("/").replace("/", "~")

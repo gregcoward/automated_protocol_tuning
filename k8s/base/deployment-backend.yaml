@@ -53,6 +53,12 @@ spec:
                   name: tuner-secrets
                   key: BIGIP_SESSION_ENCRYPTION_KEY
                   optional: true
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: tuner-secrets
+                  key: GF_SECURITY_ADMIN_PASSWORD
+                  optional: true
           volumeMounts:
             - name: config
               mountPath: /config
